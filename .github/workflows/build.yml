@@ -210,7 +210,12 @@ jobs:
           PY
 
           echo "==> Extracting Clang"
-          tar -xzf "$ARCHIVE" -C "$DEST"
+          if [[ "$CLANG_URL" == *.tar.xz ]]; then
+            tar -xJf "$ARCHIVE" -C "$DEST"
+          else
+            tar -xzf "$ARCHIVE" -C "$DEST"
+          fi
+
 
           CLANG_BIN="$(find "$DEST" -type f -path '*/bin/clang' -print -quit)"
           if [[ -z "$CLANG_BIN" ]]; then
