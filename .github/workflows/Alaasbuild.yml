@@ -1,0 +1,322 @@
+name: Custom Peridot Kernel Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Kernel defconfig to build"
+        required: false
+        type: choice
+        default: peridot_defconfig
+        options:
+          - peridot_defconfig
+          - gki_defconfig
+      clean_build:
+        description: "Delete previous build output before building"
+        required: false
+        type: boolean
+        default: true
+      jobs:
+        description: "Parallel build jobs"
+        required: false
+        type: number
+        default: 12
+      clang_url:
+        description: "Custom clang tar.gz URL (optional)"
+        required: false
+        type: string
+        default: ""
+      release_tag:
+        description: "Release tag prefix"
+        required: false
+        type: string
+        default: "peridot-kernel"
+      create_release:
+        description: "Create GitHub Release"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: custom-peridot-kernel
+  cancel-in-progress: false
+
+jobs:
+  build-kernel:
+    name: Build + Release Peridot Kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_VERSION: ${{ github.run_number }}
+      TZ: Asia/Ho_Chi_Minh
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Setup metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BRANCH_NAME=${GITHUB_REF_NAME:-main}" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
+          echo "RELEASE_PREFIX=${{ inputs.release_tag }}" >> "$GITHUB_ENV"
+          echo "DEFCONFIG_NAME=${{ inputs.defconfig }}" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            curl \
+            device-tree-compiler \
+            flex \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            lld \
+            llvm \
+            python3 \
+            rsync \
+            unzip \
+            xz-utils \
+            zip \
+            zlib1g-dev \
+            zstd
+
+      - name: Select clang toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEFAULT_CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/e664e5341213d99e240ba986c91221b25e6dbbb9/clang-r487747c.tar.gz"
+          CLANG_URL="${{ inputs.clang_url }}"
+          if [[ -z "$CLANG_URL" ]]; then
+            CLANG_URL="$DEFAULT_CLANG_URL"
+          fi
+          echo "Using Clang URL: $CLANG_URL"
+          echo "CLANG_URL=$CLANG_URL" >> "$GITHUB_ENV"
+
+      - name: Download and extract clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/clang.tar.gz"
+          DEST="$RUNNER_TEMP/clang"
+          mkdir -p "$DEST"
+
+          curl -L --fail --retry 3 --retry-delay 5 -A "Mozilla/5.0" "$CLANG_URL" -o "$ARCHIVE"
+
+          if [[ "$CLANG_URL" == *.tar.xz ]]; then
+            tar -xJf "$ARCHIVE" -C "$DEST"
+          else
+            tar -xzf "$ARCHIVE" -C "$DEST"
+          fi
+
+          CLANG_BIN="$(find "$DEST" -type f -path '*/bin/clang' -o -type l -path '*/bin/clang' | head -n 1)"
+          if [[ -z "$CLANG_BIN" ]]; then
+            CLANG_BIN="$(find "$DEST" -type f -path '*/bin/clang-*' -o -type l -path '*/bin/clang-*' | head -n 1)"
+          fi
+          if [[ -z "$CLANG_BIN" ]]; then
+            echo "::error::No usable clang binary found in downloaded archive"
+            find "$DEST" -maxdepth 5 -print | head -100 || true
+            exit 1
+          fi
+
+          CLANG_BIN_DIR="$(dirname "$CLANG_BIN")"
+          echo "$CLANG_BIN_DIR" >> "$GITHUB_PATH"
+          echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
+          "$CLANG_BIN" --version | head -n 1
+
+      - name: Clean old build
+        if: ${{ inputs.clean_build }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf out dist
+
+      - name: Configure kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$CLANG_BIN_DIR:$PATH"
+          make O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            ${{ inputs.defconfig }}
+
+      - name: Build kernel
+        shell: bash
+        env:
+          BUILD_JOBS: ${{ inputs.jobs }}
+        run: |
+          set -euo pipefail
+          export PATH="$CLANG_BIN_DIR:$PATH"
+          START=$(date +%s)
+          LOG="$RUNNER_TEMP/kernel-build.log"
+
+          echo "Build started: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+          make -j"$BUILD_JOBS" O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            Image.gz dtbs 2>&1 | tee "$LOG"
+
+          RESULT=${PIPESTATUS[0]}
+          END=$(date +%s)
+          DURATION=$((END - START))
+          echo "BUILD_SECONDS=$DURATION" >> "$GITHUB_ENV"
+
+          if [[ "$RESULT" -ne 0 ]]; then
+            echo "::error::Kernel build failed with exit code $RESULT"
+            grep -niE 'error:|fatal error:|undefined reference|No such file|No rule to make|Error [0-9]+' "$LOG" | tail -80 || true
+            exit "$RESULT"
+          fi
+
+      - name: Upload raw log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-log-${{ env.SHORT_SHA }}
+          path: ${{ runner.temp }}/kernel-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Package output
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIST="$RUNNER_TEMP/dist"
+          mkdir -p "$DIST/dtbs"
+
+          IMAGE="out/arch/arm64/boot/Image.gz"
+          test -s "$IMAGE"
+          cp "$IMAGE" "$DIST/Image.gz"
+
+          if [[ -d out/arch/arm64/boot/dts ]]; then
+            find out/arch/arm64/boot/dts \
+              -type f -name '*.dtb' \
+              -exec cp --parents {} "$DIST/dtbs/" \;
+          fi
+
+          tar -czf "$DIST/dtbs.tar.gz" -C "$DIST" dtbs
+
+          if [[ -d anykernel ]]; then
+            mkdir -p "$DIST/anykernel"
+            cp -a anykernel/. "$DIST/anykernel/"
+            cp "$DIST/Image.gz" "$DIST/anykernel/Image.gz"
+            (cd "$DIST/anykernel" && zip -r ../Peridot-Kernel-${SHORT_SHA}.zip . >/dev/null)
+          fi
+
+          KVER=$(make -s O=out ARCH=arm64 kernelversion)
+          CC_VER=$(clang --version | head -n 1)
+          RECENT_LOG=$(git log -10 --pretty=format:'- %h %s (%an)')
+
+          cat > "$DIST/BUILD_INFO.md" <<EOF
+          # Peridot Kernel Build Report
+
+          - Repository: ${GITHUB_REPOSITORY}
+          - Branch: ${BRANCH_NAME}
+          - Commit: ${GIT_SHA}
+          - Short SHA: ${SHORT_SHA}
+          - Build date: ${BUILD_DATE}
+          - Runner: ${RUNNER_OS} / ${RUNNER_ARCH}
+          - CPU workers: ${BUILD_JOBS:-12}
+          - Architecture: ${ARCH}
+          - Defconfig: ${DEFCONFIG_NAME}
+          - Compiler: ${CC_VER}
+          - Kernel version: ${KVER}
+          - Build duration: ${BUILD_SECONDS:-unknown} seconds
+          - Release prefix: ${RELEASE_PREFIX}
+
+          ## Build configuration
+          ```text
+          ARCH=${ARCH}
+          SUBARCH=${SUBARCH}
+          LLVM=1
+          LLVM_IAS=1
+          KERNEL_DEFCONFIG=${DEFCONFIG_NAME}
+          CLANG_BIN_DIR=${CLANG_BIN_DIR}
+          ```
+
+          ## Recent commits
+          ```text
+          ${RECENT_LOG}
+          ```
+
+          ## Notes
+          - Built from GitHub Actions runner
+          - Source tree: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          - Release created automatically by workflow_dispatch
+          EOF
+
+          cat > "$DIST/CHANGELOG.md" <<EOF
+          # Changelog
+
+          ## ${BUILD_DATE}
+
+          - Build: ${GITHUB_RUN_NUMBER}
+          - Commit: ${GIT_SHA}
+          - Defconfig: ${DEFCONFIG_NAME}
+          - Compiler: ${CC_VER}
+          - Kernel version: ${KVER}
+          - Build duration: ${BUILD_SECONDS:-unknown}s
+
+          ### Recent commits
+          ${RECENT_LOG}
+          EOF
+
+          (
+            cd "$DIST"
+            sha256sum \
+              Image.gz \
+              dtbs.tar.gz \
+              BUILD_INFO.md \
+              CHANGELOG.md \
+              > SHA256SUMS
+          )
+
+          echo "DIST=$DIST" >> "$GITHUB_ENV"
+          ls -lh "$DIST"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: peridot-kernel-${{ env.SHORT_SHA }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_PREFIX }}-${{ env.SHORT_SHA }}
+          name: "Peridot Kernel ${{ env.SHORT_SHA }}"
+          body_path: ${{ runner.temp }}/dist/BUILD_INFO.md
+          generate_release_notes: false
+          files: |
+            ${{ runner.temp }}/dist/Image.gz
+            ${{ runner.temp }}/dist/dtbs.tar.gz
+            ${{ runner.temp }}/dist/BUILD_INFO.md
+            ${{ runner.temp }}/dist/CHANGELOG.md
+            ${{ runner.temp }}/dist/SHA256SUMS
+            ${{ runner.temp }}/dist/Peridot-Kernel-${{ env.SHORT_SHA }}.zip
+          fail_on_unmatched_files: true
