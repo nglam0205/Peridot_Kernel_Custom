@@ -252,6 +252,32 @@ jobs:
 
           "$CLANG_BIN" --version
 
+
+      - name: Diagnose compiler target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "== Clang version =="
+          clang --version
+
+          echo "== Compiler flags and cortex-a720 references =="
+          grep -RInE 'cortex-a720|mcpu=' \
+            Makefile arch/arm64 scripts . \
+            --exclude-dir=.git \
+            --exclude-dir=out \
+            --exclude='*.dtb' \
+            --exclude='*.o' \
+            2>/dev/null | head -200 || true
+
+          echo "== Test cortex-a720 support =="
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/test.c"
+          clang --target=aarch64-linux-gnu \
+            -mcpu=cortex-a720 \
+            -c "$RUNNER_TEMP/test.c" \
+            -o "$RUNNER_TEMP/test.o"
+
+
       - name: Configure kernel
         shell: bash
         run: |
