@@ -263,13 +263,15 @@ jobs:
             LLVM_IAS=1 \
             peridot_defconfig
 
+
       - name: Build kernel using all CPUs
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           JOBS="$(nproc)"
           START="$(date +%s)"
+          LOG="$RUNNER_TEMP/build.log"
 
           echo "Runner CPUs: $JOBS"
           echo "Build started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -278,13 +280,31 @@ jobs:
             ARCH=arm64 \
             LLVM=1 \
             LLVM_IAS=1 \
-            Image.gz dtbs
+            Image.gz dtbs 2>&1 | tee "$LOG"
 
+          RESULT=${PIPESTATUS[0]}
           END="$(date +%s)"
-          DURATION=$((END - START))
 
-          echo "BUILD_SECONDS=$DURATION" >> "$GITHUB_ENV"
-          echo "Build duration: $DURATION seconds"
+          echo "Build duration: $((END - START)) seconds"
+
+          if [[ "$RESULT" -ne 0 ]]; then
+            echo "::error::Kernel build failed with exit code $RESULT"
+            echo "===== Error lines ====="
+            grep -niE 'error:|fatal error:|undefined reference|No such file|No rule to make|Error [0-9]+' "$LOG" | tail -80 || true
+            exit "$RESULT"
+          fi
+
+          echo "BUILD_SECONDS=$((END - START))" >> "$GITHUB_ENV"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
 
       - name: Package build outputs
         shell: bash
