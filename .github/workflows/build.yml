@@ -5,9 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       clang_url:
-        description: "Direct URL to the verified Android Clang .tar.gz archive"
-        required: true
+        description: "Optional custom Clang archive URL (empty = default r487747c)"
+        required: false
         type: string
+        default: ""
 
 permissions:
   contents: write
@@ -18,46 +19,100 @@ concurrency:
 
 jobs:
   build:
-    name: Build kernel and publish Release
+    name: Build and Release
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
-      - name: Checkout latest main commit
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          submodules: recursive
+          submodules: false
 
-      - name: Update to newest commit
+      - name: Get newest commit
         shell: bash
         run: |
           set -euo pipefail
           git fetch origin main
           git checkout --detach origin/main
+
           echo "COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          echo "Build commit: $(git rev-parse HEAD)"
+
+          echo "Commit: $(git rev-parse HEAD)"
           git log -1 --format='%h %s'
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential ccache \
-            flex git libelf-dev libssl-dev \
-            lld llvm clang \
-            python3 python3-pip \
-            rsync unzip zip \
-            zlib1g-dev libncurses-dev \
-            device-tree-compiler \
+            bc bison build-essential flex \
+            git libelf-dev libssl-dev \
+            lld llvm python3 rsync \
+            unzip zip zlib1g-dev \
+            libncurses-dev device-tree-compiler \
             cpio curl xz-utils zstd
 
-      - name: Download Clang with realtime progress
+      - name: Setup KernelSU-Next
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "==> Setting up KernelSU-Next"
+
+          if [[ -f .gitmodules ]]; then
+            cat .gitmodules
+          fi
+
+          if [[ -d KernelSU-Next/.git ]]; then
+            echo "KernelSU-Next repository already exists"
+          else
+            rm -rf KernelSU-Next
+
+            git clone --depth=1 \
+              https://github.com/KernelSU-Next/KernelSU-Next.git \
+              KernelSU-Next
+          fi
+
+          echo "KernelSU-Next commit:"
+          git -C KernelSU-Next log -1 --format='%h %s'
+
+          mkdir -p drivers
+
+          if [[ -L drivers/kernelsu ]]; then
+            rm drivers/kernelsu
+          elif [[ -e drivers/kernelsu ]]; then
+            rm -rf drivers/kernelsu
+          fi
+
+          ln -s ../KernelSU-Next/kernel drivers/kernelsu
+
+          ls -l drivers/kernelsu
+          test -e drivers/kernelsu
+
+      - name: Select Clang URL
         shell: bash
         env:
-          CLANG_URL: ${{ inputs.clang_url }}
+          CUSTOM_CLANG_URL: ${{ inputs.clang_url }}
+        run: |
+          set -euo pipefail
+
+          DEFAULT_CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/e664e5341213d99e240ba986c91221b25e6dbbb9/clang-r487747c.tar.gz"
+
+          if [[ -n "$CUSTOM_CLANG_URL" ]]; then
+            CLANG_URL="$CUSTOM_CLANG_URL"
+            echo "Using custom Clang URL"
+          else
+            CLANG_URL="$DEFAULT_CLANG_URL"
+            echo "Using default Android Clang r487747c"
+          fi
+
+          echo "CLANG_URL=$CLANG_URL" >> "$GITHUB_ENV"
+
+      - name: Download Clang with live progress
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -65,15 +120,16 @@ jobs:
           DEST="$RUNNER_TEMP/clang"
           mkdir -p "$DEST"
 
-          cat > "$RUNNER_TEMP/download.py" <<'PY'
+          python3 - "$CLANG_URL" "$ARCHIVE" <<'PY'
           import sys
           import time
-          import urllib.request
           import os
+          import urllib.request
 
           url, output = sys.argv[1:3]
           request = urllib.request.Request(
-              url, headers={"User-Agent": "Mozilla/5.0"}
+              url,
+              headers={"User-Agent": "Mozilla/5.0"}
           )
 
           start = time.time()
@@ -91,8 +147,11 @@ jobs:
 
           try:
               with urllib.request.urlopen(request, timeout=60) as response:
-                  total = int(response.headers.get("Content-Length", 0))
-                  print(f"HTTP {response.status}", flush=True)
+                  total = int(
+                      response.headers.get("Content-Length", 0)
+                  )
+
+                  print(f"HTTP status: {response.status}", flush=True)
                   print(
                       f"Total: {human(total) if total else 'unknown'}",
                       flush=True
@@ -103,26 +162,44 @@ jobs:
                           chunk = response.read(256 * 1024)
                           if not chunk:
                               break
+
                           f.write(chunk)
                           downloaded += len(chunk)
 
                           now = time.time()
                           elapsed = now - last_time
+
                           if elapsed >= 1:
-                              speed = (downloaded - last_size) / elapsed
-                              pct = downloaded * 100 / total if total else 0
+                              speed = (
+                                  (downloaded - last_size) / elapsed
+                              )
+
+                              pct = (
+                                  downloaded * 100 / total
+                                  if total else 0
+                              )
+
                               eta = (
                                   (total - downloaded) / speed
                                   if total and speed > 0 else None
                               )
+
                               eta_text = (
                                   f"{int(eta // 60)}m "
                                   f"{int(eta % 60)}s"
                                   if eta is not None else "unknown"
                               )
+
                               width = 24
-                              filled = int(width * pct / 100) if total else 0
-                              bar = "#" * filled + "-" * (width - filled)
+                              filled = (
+                                  int(width * pct / 100)
+                                  if total else 0
+                              )
+                              bar = (
+                                  "#" * filled
+                                  + "-" * (width - filled)
+                              )
+
                               print(
                                   f"[{bar}] {pct:6.2f}% | "
                                   f"{human(downloaded)} / "
@@ -131,6 +208,7 @@ jobs:
                                   f"ETA {eta_text}",
                                   flush=True
                               )
+
                               last_time = now
                               last_size = downloaded
 
@@ -139,19 +217,26 @@ jobs:
                   f"{time.time() - start:.1f}s",
                   flush=True
               )
+
           except Exception as e:
               if os.path.exists(output):
                   os.remove(output)
-              print(f"Download failed: {e}", file=sys.stderr, flush=True)
+
+              print(
+                  f"Download failed: {e}",
+                  file=sys.stderr,
+                  flush=True
+              )
               sys.exit(1)
           PY
-
-          python3 "$RUNNER_TEMP/download.py" "$CLANG_URL" "$ARCHIVE"
 
           echo "==> Extracting Clang"
           tar -xzf "$ARCHIVE" -C "$DEST"
 
-          CLANG_BIN="$(find "$DEST" -type f -path '*/bin/clang' -print -quit)"
+          CLANG_BIN="$(
+            find "$DEST" -type f -path '*/bin/clang' -print -quit
+          )"
+
           if [[ -z "$CLANG_BIN" ]]; then
             echo "::error::Archive does not contain bin/clang"
             find "$DEST" -maxdepth 4 -type f | head -100
@@ -159,21 +244,26 @@ jobs:
           fi
 
           CLANG_BIN_DIR="$(dirname "$CLANG_BIN")"
+
+          test -x "$CLANG_BIN_DIR/ld.lld"
+
           echo "$CLANG_BIN_DIR" >> "$GITHUB_PATH"
           echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
 
           "$CLANG_BIN" --version
-          test -x "$CLANG_BIN_DIR/ld.lld"
 
       - name: Configure kernel
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+
+          make O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
             peridot_defconfig
 
-      - name: Build kernel using all runner CPUs
+      - name: Build kernel using all CPUs
         shell: bash
         run: |
           set -euo pipefail
@@ -182,7 +272,7 @@ jobs:
           START="$(date +%s)"
 
           echo "Runner CPUs: $JOBS"
-          echo "Starting build: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Build started: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
           make -j"$JOBS" O=out \
             ARCH=arm64 \
@@ -191,10 +281,12 @@ jobs:
             Image.gz dtbs
 
           END="$(date +%s)"
-          echo "BUILD_SECONDS=$((END - START))" >> "$GITHUB_ENV"
-          echo "Build duration: $((END - START)) seconds"
+          DURATION=$((END - START))
 
-      - name: Package outputs and build information
+          echo "BUILD_SECONDS=$DURATION" >> "$GITHUB_ENV"
+          echo "Build duration: $DURATION seconds"
+
+      - name: Package build outputs
         shell: bash
         run: |
           set -euo pipefail
@@ -206,39 +298,45 @@ jobs:
           test -s "$IMAGE"
           cp "$IMAGE" "$DIST/Image.gz"
 
-          find out/arch/arm64/boot/dts -type f -name '*.dtb' \
-            -exec cp --parents {} "$DIST/dtbs/" \;
+          if [[ -d out/arch/arm64/boot/dts ]]; then
+            find out/arch/arm64/boot/dts \
+              -type f -name '*.dtb' \
+              -exec cp --parents {} "$DIST/dtbs/" \;
+          fi
 
           tar -czf "$DIST/dtbs.tar.gz" -C "$DIST" dtbs
 
           {
-            echo "# Peridot kernel build"
+            echo "# Peridot Kernel Build"
             echo
             echo "- Repository: $GITHUB_REPOSITORY"
             echo "- Commit: $COMMIT_SHA"
             echo "- Branch: main"
             echo "- Runner: $RUNNER_OS / $RUNNER_ARCH"
             echo "- CPU workers: $(nproc)"
-            echo "- Clang: $(clang --version | head -1)"
+            echo "- Compiler: $(clang --version | head -1)"
             echo "- Kernel version: $(make -s O=out ARCH=arm64 kernelversion)"
             echo "- Build duration: ${BUILD_SECONDS:-unknown} seconds"
             echo "- Finished: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo
             echo "## Recent commits"
-            git log -10 --pretty=format:'- %h %s (%an)' 
+            git log -10 --pretty=format:'- %h %s (%an)'
             echo
           } > "$DIST/BUILD_INFO.md"
 
           (
             cd "$DIST"
-            sha256sum Image.gz dtbs.tar.gz BUILD_INFO.md > SHA256SUMS
+            sha256sum \
+              Image.gz \
+              dtbs.tar.gz \
+              BUILD_INFO.md \
+              > SHA256SUMS
           )
 
-          echo "==> Output files"
-          ls -lh "$DIST"
           echo "DIST=$DIST" >> "$GITHUB_ENV"
+          ls -lh "$DIST"
 
-      - name: Upload build artifacts
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: peridot-kernel-${{ env.SHORT_SHA }}
@@ -253,11 +351,11 @@ jobs:
           target_commitish: ${{ env.COMMIT_SHA }}
           name: "Peridot Kernel Build ${{ env.SHORT_SHA }}"
           body_path: ${{ runner.temp }}/dist/BUILD_INFO.md
+          generate_release_notes: true
           files: |
             ${{ runner.temp }}/dist/Image.gz
             ${{ runner.temp }}/dist/dtbs.tar.gz
             ${{ runner.temp }}/dist/BUILD_INFO.md
             ${{ runner.temp }}/dist/SHA256SUMS
           fail_on_unmatched_files: true
-          generate_release_notes: true
 
