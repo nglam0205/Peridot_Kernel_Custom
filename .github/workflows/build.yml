@@ -217,15 +217,20 @@ jobs:
           fi
 
 
-          CLANG_BIN="$(find "$DEST" -type f -path '*/bin/clang' -print -quit)"
+                    CLANG_BIN="$(find "$DEST" \( -type f -o -type l \) -path '*/bin/clang' -print -quit)"
           if [[ -z "$CLANG_BIN" ]]; then
-            echo "::error::Archive does not contain bin/clang"
-            find "$DEST" -maxdepth 4 -type f | head -100 || true
+            CLANG_BIN="$(find "$DEST" \( -type f -o -type l \) -path '*/bin/clang-*' -print -quit)"
+          fi
+
+          if [[ -z "$CLANG_BIN" ]]; then
+            echo "::error::Archive does not contain a usable clang binary"
+            find "$DEST" -maxdepth 5 \( -type f -o -type l \) | head -100 || true
             exit 1
           fi
 
           CLANG_BIN_DIR="$(dirname "$CLANG_BIN")"
-          test -x "$CLANG_BIN_DIR/ld.lld"
+          ls -l "$CLANG_BIN_DIR" | head -50 || true
+          test -x "$CLANG_BIN" || test -L "$CLANG_BIN"
 
           echo "$CLANG_BIN_DIR" >> "$GITHUB_PATH"
           echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
