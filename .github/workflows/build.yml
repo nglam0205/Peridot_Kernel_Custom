@@ -6,8 +6,8 @@ on:
     inputs:
       clean_build:
         description: "Clean build output"
-        required: true
         type: boolean
+        required: true
         default: false
 
 permissions:
@@ -19,48 +19,63 @@ concurrency:
 
 jobs:
   build:
+    name: Build peridot ARM64
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
-      - name: Checkout newest main commit
+      - name: Checkout latest main
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          submodules: false
+          persist-credentials: true
 
-      - name: Record commit
+      - name: Record source commit
         id: commit
         shell: bash
         run: |
+          set -euo pipefail
           git fetch origin main
           git checkout --detach origin/main
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "Build commit: $(git rev-parse HEAD)"
+          echo "date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential cpio flex \
-            git libelf-dev libssl-dev lld llvm clang \
-            pahole python3 python-is-python3 \
-            rsync unzip zip zstd lz4 device-tree-compiler
+            bc bison build-essential cpio flex git \
+            libelf-dev libssl-dev lld llvm clang \
+            pahole python3 python-is-python3 rsync \
+            unzip zip zstd lz4 device-tree-compiler curl
 
       - name: Download Android Clang
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/clang"
-          curl -fL --retry 3 \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz" \
-            -o "$RUNNER_TEMP/clang.tar.gz"
-          tar -xzf "$RUNNER_TEMP/clang.tar.gz" \
-            -C "$RUNNER_TEMP/clang"
-          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/clang/bin/clang" --version
+          git clone --depth=1 \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            "$RUNNER_TEMP/clang-repo"
+
+          cd "$RUNNER_TEMP/clang-repo"
+          git fetch --depth=1 origin \
+            refs/tags/clang-r487747c:refs/tags/clang-r487747c || true
+
+          if git rev-parse -q --verify refs/tags/clang-r487747c >/dev/null; then
+            git checkout refs/tags/clang-r487747c
+          fi
+
+          if [[ ! -x bin/clang ]]; then
+            echo "::error::Could not find clang-r487747c in the downloaded repository."
+            exit 1
+          fi
+
+          echo "$RUNNER_TEMP/clang-repo/bin" >> "$GITHUB_PATH"
+          bin/clang --version
 
       - name: Prepare KernelSU-Next
         shell: bash
@@ -74,60 +89,118 @@ jobs:
           test -f drivers/kernelsu/Kconfig
           git -C KernelSU-Next log -1 --oneline
 
-      - name: Configure kernel
+      - name: Record build start
+        id: start
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.clean_build }}" == "true" ]]; then
+          date +%s > "$RUNNER_TEMP/build-start"
+          echo "started=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+          echo "cpus=$(nproc)" >> "$GITHUB_OUTPUT"
+          echo "runner=$(uname -m)" >> "$GITHUB_OUTPUT"
+          echo "clang=$(clang --version | head -n 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure kernel
+        shell: bash
+        env:
+          CLEAN_BUILD: ${{ inputs.clean_build }}
+        run: |
+          set -euo pipefail
+          if [[ "$CLEAN_BUILD" == "true" ]]; then
             rm -rf out
           fi
-          make O=out ARCH=arm64 LLVM=1 \
-            CC="$RUNNER_TEMP/clang/bin/clang" \
-            LD="$RUNNER_TEMP/clang/bin/ld.lld" \
-            DTC=/usr/bin/dtc peridot_defconfig
 
-      - name: Build kernel using all runner CPUs
+          make O=out ARCH=arm64 LLVM=1 \
+            CC=clang LD=ld.lld DTC=/usr/bin/dtc \
+            peridot_defconfig
+
+      - name: Build kernel
         shell: bash
         run: |
           set -euo pipefail
           JOBS="$(nproc)"
-          echo "Using $JOBS parallel jobs"
+          echo "Building with $JOBS jobs"
+
           make O=out ARCH=arm64 LLVM=1 \
-            CC="$RUNNER_TEMP/clang/bin/clang" \
-            LD="$RUNNER_TEMP/clang/bin/ld.lld" \
-            DTC=/usr/bin/dtc \
+            CC=clang LD=ld.lld DTC=/usr/bin/dtc \
             -j"$JOBS" Image.gz dtbs
 
           test -s out/arch/arm64/boot/Image.gz
 
-      - name: Package build outputs
-        id: package
+      - name: Record build duration
+        id: duration
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          SHA="${{ steps.commit.outputs.short }}"
-          PKG="RealKing-peridot-${SHA}"
+          if [[ -f "$RUNNER_TEMP/build-start" ]]; then
+            START=$(cat "$RUNNER_TEMP/build-start")
+            END=$(date +%s)
+            ELAPSED=$((END - START))
+            printf -v HUMAN '%02d:%02d:%02d' \
+              "$((ELAPSED/3600))" "$((ELAPSED%3600/60))" "$((ELAPSED%60))"
+            echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
+            echo "human=$HUMAN" >> "$GITHUB_OUTPUT"
+            echo "finished=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package outputs
+        if: success()
+        shell: bash
+        env:
+          SHORT_SHA: ${{ steps.commit.outputs.short }}
+        run: |
+          set -euo pipefail
           mkdir -p release "$RUNNER_TEMP/anykernel"
 
-          cp out/arch/arm64/boot/Image.gz "release/Image-${SHA}.gz"
+          cp out/arch/arm64/boot/Image.gz \
+            "release/Image-${SHORT_SHA}.gz"
 
           cp -a anykernel/. "$RUNNER_TEMP/anykernel/"
-          cp out/arch/arm64/boot/Image.gz "$RUNNER_TEMP/anykernel/Image.gz"
+          cp out/arch/arm64/boot/Image.gz \
+            "$RUNNER_TEMP/anykernel/Image.gz"
 
           (
             cd "$RUNNER_TEMP/anykernel"
-            zip -r "$GITHUB_WORKSPACE/release/${PKG}.zip" .
+            zip -r "$GITHUB_WORKSPACE/release/RealKing-peridot-${SHORT_SHA}.zip" .
           )
 
           if [[ -d out/arch/arm64/boot/dts ]]; then
-            tar -czf "release/DTBs-${SHA}.tar.gz" \
+            tar -czf "release/DTBs-${SHORT_SHA}.tar.gz" \
               -C out/arch/arm64/boot dts
           fi
 
-          echo "zip=release/${PKG}.zip" >> "$GITHUB_OUTPUT"
+          sha256sum release/* > release/SHA256SUMS
           ls -lh release/
 
+      - name: Generate changelog
+        id: changelog
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREVIOUS_TAG="$(git tag --sort=-creatordate | head -n 1 || true)"
+
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            NOTES="$(git log --no-merges --pretty=format:'- %s (`%h`)' \
+              "$PREVIOUS_TAG"..HEAD)"
+          else
+            NOTES="$(git log -10 --no-merges \
+              --pretty=format:'- %s (`%h`)' HEAD)"
+          fi
+
+          if [[ -z "$NOTES" ]]; then
+            NOTES="- No new commits since previous tag."
+          fi
+
+          {
+            echo "notes<<CHANGELOG_EOF"
+            echo "$NOTES"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Upload build artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: RealKing-peridot-${{ steps.commit.outputs.short }}
@@ -136,11 +209,40 @@ jobs:
           retention-days: 30
 
       - name: Publish GitHub Release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ steps.commit.outputs.short }}
-          name: "RealKing Kernel build ${{ steps.commit.outputs.short }}"
-          target_commitish: main
-          generate_release_notes: true
+          name: "RealKing Kernel ${{ steps.commit.outputs.short }}"
+          target_commitish: ${{ steps.commit.outputs.sha }}
+          body: |
+            ## Build information
+
+            - Device: Redmi Turbo 3 / POCO F6 (`peridot`)
+            - Architecture: ARM64
+            - Kernel source commit: `${{ steps.commit.outputs.sha }}`
+            - Source commit date: `${{ steps.commit.outputs.date }}`
+            - Compiler: ${{ steps.start.outputs.clang }}
+            - Runner: Ubuntu 24.04 (${{ steps.start.outputs.runner }})
+            - Parallel jobs: ${{ steps.start.outputs.cpus }}
+            - Build started: ${{ steps.start.outputs.started }}
+            - Build finished: ${{ steps.duration.outputs.finished }}
+            - Build duration: ${{ steps.duration.outputs.human }}
+
+            ## Changelog
+
+            ${{ steps.changelog.outputs.notes }}
+
+            ## Files
+
+            - `Image-*.gz`: compressed kernel image
+            - `RealKing-peridot-*.zip`: AnyKernel package
+            - `DTBs-*.tar.gz`: device tree blobs, if generated
+            - `SHA256SUMS`: file checksums
+
+            ## Warning
+
+            This is an automatically generated build. The AnyKernel ZIP is provided for inspection only. Do not flash it unless you have independently verified device compatibility and recovery behavior.
           files: release/*
           fail_on_unmatched_files: true
+
